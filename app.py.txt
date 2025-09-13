@@ -1,0 +1,172 @@
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+from datetime import datetime
+
+st.set_page_config(page_title="Modelo DuPont Multi-Período", layout="wide")
+
+st.title("Modelo DuPont para medir la rentabilidad de negocios")
+st.caption("Sube tu archivo CSV o Excel con los campos: Periodo, Ventas Netas, Utilidad Neta, Activos Totales, Capital Contable.")
+
+# --- Sidebar: info y enlace a GitHub (opcional) ---
+with st.sidebar:
+    st.header("Opciones")
+    repo_url = st.text_input("URL del repositorio (opcional)", value="https://github.com/tu-usuario/tu-repo")
+    if repo_url:
+        st.markdown(f"[Abrir repositorio]({repo_url})")
+
+    st.markdown("---")
+    st.subheader("Descargar plantilla")
+    plantilla = pd.DataFrame({
+        "Periodo": ["2021", "2022", "2023"],
+        "Ventas Netas": [1000000, 1200000, 1500000],
+        "Utilidad Neta": [80000, 108000, 135000],
+        "Activos Totales": [500000, 600000, 750000],
+        "Capital Contable": [250000, 280000, 320000],
+    })
+    buf_tpl = io.BytesIO()
+    plantilla.to_csv(buf_tpl, index=False, encoding="utf-8-sig")
+    st.download_button(
+        "Descargar plantilla CSV",
+        data=buf_tpl.getvalue(),
+        file_name="plantilla_dupont.csv",
+        mime="text/csv"
+    )
+
+# --- Carga de archivo ---
+archivo = st.file_uploader("Cargar archivo (CSV o XLSX)", type=["csv", "xlsx"])
+
+def _clean_period(v):
+    # Convierte fechas/números a texto legible y ordenable
+    try:
+        # Intentar parsear fecha
+        dt = pd.to_datetime(v, errors="raise")
+        # Si tiene mes y día, formatear AAAA-MM; si solo año, usar AAAA
+        if dt.day == 1 and dt.month == 1 and (dt.hour == 0):
+            return dt.strftime("%Y")
+        return dt.strftime("%Y-%m")
+    except Exception:
+        return str(v)
+
+if archivo is not None:
+    # Leer archivo
+    if archivo.name.lower().endswith(".csv"):
+        df = pd.read_csv(archivo)
+    else:
+        df = pd.read_excel(archivo)
+
+    # Normalizar columnas (quitar espacios y bajar a título)
+    df.columns = [c.strip() for c in df.columns]
+
+    requeridas = ["Periodo", "Ventas Netas", "Utilidad Neta", "Activos Totales", "Capital Contable"]
+    faltantes = [c for c in requeridas if c not in df.columns]
+    if faltantes:
+        st.error(f"Faltan columnas requeridas: {', '.join(faltantes)}")
+        st.stop()
+
+    # Limpieza y tipos
+    df = df.copy()
+    df["Periodo"] = df["Periodo"].apply(_clean_period)
+
+    for c in ["Ventas Netas", "Utilidad Neta", "Activos Totales", "Capital Contable"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Validaciones básicas
+    if df[requeridas].isna().any().any():
+        st.warning("Hay valores vacíos o no numéricos. Revisa tu base.")
+    if (df["Activos Totales"] == 0).any():
+        st.warning("Existen Activos Totales = 0. Esto puede afectar Rotación y métricas derivadas.")
+    if (df["Capital Contable"] == 0).any():
+        st.warning("Existen Capital Contable = 0. Esto puede afectar Apalancamiento y métricas derivadas.")
+
+    # --- Cálculos DuPont (usar FRACCIONES para ROE/ROA; mostrar como % con 1 decimal) ---
+    # Fórmulas pedidas:
+    # Margen Neto = Utilidad Neta / Ventas Netas
+    # Rotación = Ventas Netas / Activos Totales
+    # Apalancamiento = Activos Totales / Capital Contable
+    # ROE = Margen Neto × Rotación
+    # ROA = Rotación × Apalancamiento
+    # Pay Back Capital = 1 / ROE
+    # Pay Back Activos = 1 / ROA
+
+    df["Margen_Neto_frac"] = df["Utilidad Neta"] / df["Ventas Netas"]
+    df["Rotacion"] = df["Ventas Netas"] / df["Activos Totales"]
+    df["Apalancamiento"] = df["Activos Totales"] / df["Capital Contable"]
+    df["ROE_frac"] = df["Margen_Neto_frac"] * df["Rotacion"]
+    df["ROA_frac"] = df["Rotacion"] * df["Apalancamiento"]
+
+    # Paybacks (manejar división por cero)
+    df["PayBack_Capital"] = np.where(df["ROE_frac"] != 0, 1 / df["ROE_frac"], np.nan)
+    df["PayBack_Activos"] = np.where(df["ROA_frac"] != 0, 1 / df["ROA_frac"], np.nan)
+
+    # Convertir a porcentajes *solo para mostrar* (1 decimal)
+    def pct1(x):
+        return None if pd.isna(x) else f"{x*100:.1f}%"
+
+    def num1(x):
+        return None if pd.isna(x) else f"{x:.1f}"
+
+    # Construir el reporte pivotado: columnas = Periodos, renglones = indicadores
+    periodos_orden = sorted(df["Periodo"].unique(), key=lambda s: [int(t) if t.isdigit() else t for t in s.replace("-", " ").split(" ")])
+
+    filas = [
+        ("Margen",          df.set_index("Periodo")["Margen_Neto_frac"].to_dict(), "rel"),
+        ("Rotación",        df.set_index("Periodo")["Rotacion"].to_dict(),         "abs"),
+        ("Apalancamiento",  df.set_index("Periodo")["Apalancamiento"].to_dict(),   "abs"),
+        ("ROE",             df.set_index("Periodo")["ROE_frac"].to_dict(),         "rel"),
+        ("ROA",             df.set_index("Periodo")["ROA_frac"].to_dict(),         "rel"),
+        ("Pay Back Capital",df.set_index("Periodo")["PayBack_Capital"].to_dict(),  "abs"),
+        ("Pay Back Activos",df.set_index("Periodo")["PayBack_Activos"].to_dict(),  "abs"),
+    ]
+
+    # DataFrame numérico (para exportar) y DataFrame formateado (para visualizar)
+    data_num = {}
+    data_fmt = {}
+    for nombre, serie_dict, tipo in filas:
+        fila_vals_num = []
+        fila_vals_fmt = []
+        for p in periodos_orden:
+            val = serie_dict.get(p, np.nan)
+            fila_vals_num.append(val)
+            if tipo == "rel":
+                fila_vals_fmt.append("" if pd.isna(val) else f"{val*100:.1f}%")
+            else:
+                fila_vals_fmt.append("" if pd.isna(val) else f"{val:.1f}")
+        data_num[nombre] = fila_vals_num
+        data_fmt[nombre] = fila_vals_fmt
+
+    df_num = pd.DataFrame(data_num, index=periodos_orden).T  # filas=indicadores, cols=periodos
+    df_fmt = pd.DataFrame(data_fmt, index=periodos_orden).T
+
+    st.subheader("Reporte (columnas = períodos, renglones = conceptos)")
+    st.dataframe(df_fmt, use_container_width=True)
+
+    # --- Descargar reporte en Excel (con los valores ya formateados a 1 decimal) ---
+    def build_excel_download(df_formateado: pd.DataFrame) -> bytes:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            # Hoja 1: Reporte formateado (texto)
+            df_formateado.to_excel(writer, sheet_name="Reporte", index=True)
+            ws = writer.sheets["Reporte"]
+            ws.set_column(0, 0, 28)  # ancho para indicador
+            ws.set_column(1, 1 + len(df_formateado.columns), 15)
+            # Hoja 2: Datos numéricos (para referencia)
+            df_num.to_excel(writer, sheet_name="Datos_Numericos", index=True)
+        return output.getvalue()
+
+    excel_bytes = build_excel_download(df_fmt)
+    st.download_button(
+        "Descargar reporte en Excel",
+        data=excel_bytes,
+        file_name=f"Reporte_DuPont_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    # --- Mostrar datos originales (opcional) ---
+    with st.expander("Ver datos originales cargados"):
+        st.dataframe(df[["Periodo","Ventas Netas","Utilidad Neta","Activos Totales","Capital Contable"]], use_container_width=True)
+
+else:
+    st.info("Carga un archivo para calcular el modelo.")
